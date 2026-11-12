@@ -1,0 +1,1420 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Copyright (c) 2021, MediaTek Inc.
+ * Copyright (c) 2021-2022, Intel Corporation.
+ *
+ * Authors:
+ *  Haijun Liu <haijun.liu@mediatek.com>
+ *  Ricardo Martinez <ricardo.martinez@linux.intel.com>
+ *  Sreehari Kancharla <sreehari.kancharla@intel.com>
+ *
+ * Contributors:
+ *  Amir Hanania <amir.hanania@intel.com>
+ *  Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+ *  Chiranjeevi Rapolu <chiranjeevi.rapolu@intel.com>
+ *  Eliot Lee <eliot.lee@intel.com>
+ *  Moises Veleta <moises.veleta@intel.com>
+ */
+
+#include <linux/atomic.h>
+#include <linux/bits.h>
+#include <linux/completion.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/gfp.h>
+#include <linux/interrupt.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/jiffies.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/pci.h>
+#include <linux/pm.h>
+#include <linux/pm_runtime.h>
+#include <linux/pm_wakeup.h>
+#include <linux/spinlock.h>
+#include <linux/suspend.h>
+#include <linux/workqueue.h>
+
+#include "t7xx_mhccif.h"
+#include "t7xx_modem_ops.h"
+#include "t7xx_pci.h"
+#include "t7xx_pcie_mac.h"
+#include "t7xx_reg.h"
+#include "t7xx_state_monitor.h"
+#include "t7xx_port_proxy.h"
+
+/* --- compatibility shim: pcim_iomap_region() was added in Linux 6.9 --- */
+#include <linux/version.h>
+#include <linux/err.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 9, 0)
+static inline void __iomem *pcim_iomap_region(struct pci_dev *pdev, int bar,
+					      const char *name)
+{
+	int ret = pcim_iomap_regions(pdev, BIT(bar), name);
+
+	if (ret)
+		return (void __iomem *)ERR_PTR(ret);
+
+	return pcim_iomap_table(pdev)[bar];
+}
+#endif
+/* --- end shim --- */
+
+
+#define DRIVER_NAME "mtk_t7xx"
+
+#define T7XX_PCI_IREG_BASE		0
+#define T7XX_PCI_EREG_BASE		2
+
+#define T7XX_INIT_TIMEOUT		20
+#define PM_SLEEP_DIS_TIMEOUT_MS		20
+#define PM_ACK_TIMEOUT_MS		5000
+#define PM_AUTOSUSPEND_MS		15000
+#define PM_RESOURCE_POLL_TIMEOUT_US	500000
+#define PM_RESOURCE_POLL_STEP_US	1000
+#define MAX_RESUME_REPROBE_ATTEMPTS	3
+#define DEFERRED_PLDR_DELAY_MS		3000
+#define DEFERRED_PLDR_RETRY_MS		2000
+
+/* When set, the .suspend callback is a no-op for suspend-to-idle: the modem
+ * firmware keeps running, the MBIM session stays open, and resume returns
+ * immediately. Idle cost is the modem's normal registered-no-traffic draw
+ * (~100 mW for FM350-GL); the win is skipping the ~25 s PLDR + port-reprobe
+ * dance that follows a normal resume. Hibernate paths (.freeze / .restore)
+ * are unaffected — the firmware loses power across S4 regardless.
+ */
+static bool keepalive_s2idle;
+module_param(keepalive_s2idle, bool, 0644);
+MODULE_PARM_DESC(keepalive_s2idle,
+		 "Skip firmware suspend handshake during suspend-to-idle (faster resume; modem stays online; ignored for hibernate)");
+
+static const char * const t7xx_mode_names[] = {
+	[T7XX_UNKNOWN] = "unknown",
+	[T7XX_READY] = "ready",
+	[T7XX_RESET] = "reset",
+	[T7XX_FASTBOOT_SWITCHING] = "fastboot_switching",
+	[T7XX_FASTBOOT_DOWNLOAD] = "fastboot_download",
+	[T7XX_FASTBOOT_DUMP] = "fastboot_dump",
+};
+
+static_assert(ARRAY_SIZE(t7xx_mode_names) == T7XX_MODE_LAST);
+
+static ssize_t t7xx_mode_store(struct device *dev,
+			       struct device_attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	struct pci_dev *pdev;
+	enum t7xx_mode mode;
+	int index = 0;
+
+	pdev = to_pci_dev(dev);
+	t7xx_dev = pci_get_drvdata(pdev);
+	if (!t7xx_dev)
+		return -ENODEV;
+
+	mode = READ_ONCE(t7xx_dev->mode);
+
+	index = sysfs_match_string(t7xx_mode_names, buf);
+	if (index == mode)
+		return -EBUSY;
+
+	if (index == T7XX_FASTBOOT_SWITCHING) {
+		if (mode == T7XX_FASTBOOT_DOWNLOAD)
+			return count;
+
+		WRITE_ONCE(t7xx_dev->mode, T7XX_FASTBOOT_SWITCHING);
+		pm_runtime_resume(dev);
+		t7xx_reset_device(t7xx_dev, FASTBOOT);
+	} else if (index == T7XX_RESET) {
+		pm_runtime_resume(dev);
+		t7xx_reset_device(t7xx_dev, PLDR);
+	}
+
+	return count;
+};
+
+static ssize_t t7xx_mode_show(struct device *dev,
+			      struct device_attribute *attr,
+			      char *buf)
+{
+	enum t7xx_mode mode = T7XX_UNKNOWN;
+	struct t7xx_pci_dev *t7xx_dev;
+	struct pci_dev *pdev;
+
+	pdev = to_pci_dev(dev);
+	t7xx_dev = pci_get_drvdata(pdev);
+	if (!t7xx_dev)
+		return -ENODEV;
+
+	mode = READ_ONCE(t7xx_dev->mode);
+	if (mode < T7XX_MODE_LAST)
+		return sysfs_emit(buf, "%s\n", t7xx_mode_names[mode]);
+
+	return sysfs_emit(buf, "%s\n", t7xx_mode_names[T7XX_UNKNOWN]);
+}
+
+static DEVICE_ATTR_RW(t7xx_mode);
+
+static ssize_t t7xx_debug_ports_store(struct device *dev,
+				      struct device_attribute *attr,
+				      const char *buf, size_t count)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	struct pci_dev *pdev;
+	bool show;
+	int ret;
+
+	pdev = to_pci_dev(dev);
+	t7xx_dev = pci_get_drvdata(pdev);
+	if (!t7xx_dev)
+		return -ENODEV;
+
+	ret = kstrtobool(buf, &show);
+	if (ret < 0)
+		return ret;
+
+	t7xx_proxy_debug_ports_show(t7xx_dev, show);
+	WRITE_ONCE(t7xx_dev->debug_ports_show, show);
+
+	return count;
+};
+
+static ssize_t t7xx_debug_ports_show(struct device *dev,
+				     struct device_attribute *attr,
+				     char *buf)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	struct pci_dev *pdev;
+	bool show;
+
+	pdev = to_pci_dev(dev);
+	t7xx_dev = pci_get_drvdata(pdev);
+	if (!t7xx_dev)
+		return -ENODEV;
+
+	show = READ_ONCE(t7xx_dev->debug_ports_show);
+
+	return sysfs_emit(buf, "%d\n", show);
+}
+
+static DEVICE_ATTR_RW(t7xx_debug_ports);
+
+static struct attribute *t7xx_attr[] = {
+	&dev_attr_t7xx_mode.attr,
+	&dev_attr_t7xx_debug_ports.attr,
+	NULL
+};
+
+static const struct attribute_group t7xx_attribute_group = {
+	.attrs = t7xx_attr,
+};
+
+void t7xx_mode_update(struct t7xx_pci_dev *t7xx_dev, enum t7xx_mode mode)
+{
+	if (!t7xx_dev)
+		return;
+
+	WRITE_ONCE(t7xx_dev->mode, mode);
+	sysfs_notify(&t7xx_dev->pdev->dev.kobj, NULL, "t7xx_mode");
+}
+
+enum t7xx_pm_state {
+	MTK_PM_EXCEPTION,
+	MTK_PM_INIT,		/* Device initialized, but handshake not completed */
+	MTK_PM_SUSPENDED,
+	MTK_PM_RESUMED,
+};
+
+static void t7xx_dev_set_sleep_capability(struct t7xx_pci_dev *t7xx_dev, bool enable)
+{
+	void __iomem *ctrl_reg = IREG_BASE(t7xx_dev) + T7XX_PCIE_MISC_CTRL;
+	u32 value;
+
+	value = ioread32(ctrl_reg);
+
+	if (enable)
+		value &= ~T7XX_PCIE_MISC_MAC_SLEEP_DIS;
+	else
+		value |= T7XX_PCIE_MISC_MAC_SLEEP_DIS;
+
+	iowrite32(value, ctrl_reg);
+}
+
+static int t7xx_wait_pm_config(struct t7xx_pci_dev *t7xx_dev)
+{
+	int ret, val;
+
+	ret = read_poll_timeout(ioread32, val,
+				(val & T7XX_PCIE_RESOURCE_STS_MSK) == T7XX_PCIE_RESOURCE_STS_MSK,
+				PM_RESOURCE_POLL_STEP_US, PM_RESOURCE_POLL_TIMEOUT_US, true,
+				IREG_BASE(t7xx_dev) + T7XX_PCIE_RESOURCE_STATUS);
+	if (ret == -ETIMEDOUT)
+		dev_warn(&t7xx_dev->pdev->dev,
+			 "PM configuration timed out — continuing without full PM support\n");
+
+	return 0;
+}
+
+static void t7xx_deferred_pldr_worker(struct work_struct *work)
+{
+	struct t7xx_pci_dev *t7xx_dev =
+		container_of(to_delayed_work(work), struct t7xx_pci_dev,
+			     deferred_pldr_work);
+	struct pci_dev *pdev = t7xx_dev->pdev;
+	u32 atr_reg_val;
+	int ret;
+
+	/* If the system re-entered suspend (STH → hibernate leg, or a
+	 * fresh user-triggered suspend landed on top of our wake), defer
+	 * again.  Running PLDR mid-suspend pulls ACPI MRST._RST and wedges
+	 * the PCIe root complex, which is exactly the hazard 5305cb5
+	 * was avoiding in the first place.
+	 */
+	if (pm_suspend_target_state != PM_SUSPEND_ON) {
+		dev_info(&pdev->dev,
+			 "[PM] Deferred PLDR: system sleeping (target=%d), rescheduling\n",
+			 pm_suspend_target_state);
+		schedule_delayed_work(&t7xx_dev->deferred_pldr_work,
+				      msecs_to_jiffies(DEFERRED_PLDR_RETRY_MS));
+		return;
+	}
+
+	/* If another resume path already recovered the modem (hibernate
+	 * .restore, or a second user-suspend/resume round that took the
+	 * reprobe branch), do not PLDR a working modem.
+	 */
+	if (READ_ONCE(t7xx_dev->mode) != T7XX_UNKNOWN) {
+		dev_info(&pdev->dev,
+			 "[PM] Deferred PLDR: mode already %u, skipping\n",
+			 READ_ONCE(t7xx_dev->mode));
+		return;
+	}
+
+	/* Take a runtime-PM reference before touching hardware.  Between
+	 * the defer (modem in L3/INIT, mode=UNKNOWN) and this worker,
+	 * runtime-PM may have decided to autosuspend the device.  PLDR on
+	 * a runtime-suspended PCI device is undefined (config space PM
+	 * mismatch).  pm_runtime_get_sync wakes the device if needed, and
+	 * we release the ref after PLDR completes.
+	 */
+	ret = pm_runtime_get_sync(&pdev->dev);
+	if (ret < 0) {
+		dev_warn(&pdev->dev,
+			 "[PM] Deferred PLDR: pm_runtime_get_sync failed (%d), aborting\n",
+			 ret);
+		pm_runtime_put_noidle(&pdev->dev);
+		complete_all(&t7xx_dev->init_done);
+		return;
+	}
+
+	/* If the PCIe link dropped since the deferral (atr reads 0x7f),
+	 * this is now the L3 "clean" path where a plain pcie_reinit would
+	 * work.  Leaving it to the next resume callback keeps the retry
+	 * accounting honest and avoids a needless PLDR.
+	 */
+	atr_reg_val = ioread32(IREG_BASE(t7xx_dev) +
+			       ATR_PCIE_WIN0_T0_ATR_PARAM_SRC_ADDR);
+	if (atr_reg_val == 0x0000007f) {
+		dev_info(&pdev->dev,
+			 "[PM] Deferred PLDR: link down since defer, leaving to resume path\n");
+		pm_runtime_put(&pdev->dev);
+		return;
+	}
+
+	if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+		dev_err(&pdev->dev,
+			"[PM] Deferred PLDR: modem dead after %u attempts, giving up\n",
+			MAX_RESUME_REPROBE_ATTEMPTS);
+		complete_all(&t7xx_dev->init_done);
+		pm_runtime_put(&pdev->dev);
+		return;
+	}
+
+	t7xx_dev->resume_reprobe_count++;
+	dev_info(&pdev->dev,
+		 "[PM] Deferred PLDR: running now, attempt %u/%u\n",
+		 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
+
+	ret = t7xx_reset_device(t7xx_dev, PLDR);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"[PM] Deferred PLDR failed: %d, unblocking suspend path\n",
+			ret);
+		complete_all(&t7xx_dev->init_done);
+	} else {
+		/* Mirror the zero-on-success convention used by the main
+		 * resume path's L3/INIT and handshake-success branches.
+		 * Without this, a subsequent L3/INIT resume would see a
+		 * stale non-zero count and prematurely hit the MAX cap.
+		 */
+		t7xx_dev->resume_reprobe_count = 0;
+	}
+
+	pm_runtime_put(&pdev->dev);
+}
+
+static int t7xx_pci_pm_init(struct t7xx_pci_dev *t7xx_dev)
+{
+	struct pci_dev *pdev = t7xx_dev->pdev;
+
+	INIT_LIST_HEAD(&t7xx_dev->md_pm_entities);
+	mutex_init(&t7xx_dev->md_pm_entity_mtx);
+	spin_lock_init(&t7xx_dev->md_pm_lock);
+	init_completion(&t7xx_dev->sleep_lock_acquire);
+	init_completion(&t7xx_dev->pm_sr_ack);
+	init_completion(&t7xx_dev->init_done);
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_INIT);
+	INIT_DELAYED_WORK(&t7xx_dev->deferred_pldr_work,
+			  t7xx_deferred_pldr_worker);
+
+	device_init_wakeup(&pdev->dev, true);
+	dev_pm_set_driver_flags(&pdev->dev, pdev->dev.power.driver_flags |
+				DPM_FLAG_NO_DIRECT_COMPLETE);
+
+	/* Prevent D3cold during s2idle — the modem firmware cannot survive
+	 * a full power cut and would reboot, breaking the resume handshake.
+	 */
+	pci_d3cold_disable(pdev);
+
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
+	pm_runtime_set_autosuspend_delay(&pdev->dev, PM_AUTOSUSPEND_MS);
+	/* Disable runtime autosuspend: FM350-GL MD suspend frequently
+	 * times out on RK3588, leaving the device in error state.
+	 * System suspend is still available.
+	 */
+	pm_runtime_use_autosuspend(&pdev->dev);
+
+	return 0;
+}
+
+void t7xx_pci_pm_init_late(struct t7xx_pci_dev *t7xx_dev)
+{
+	/* Enable the PCIe resource lock only after MD deep sleep is done */
+	t7xx_mhccif_mask_clr(t7xx_dev,
+			     D2H_INT_DS_LOCK_ACK |
+			     D2H_INT_SUSPEND_ACK |
+			     D2H_INT_RESUME_ACK |
+			     D2H_INT_SUSPEND_ACK_AP |
+			     D2H_INT_RESUME_ACK_AP);
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_RESUMED);
+
+	pm_runtime_mark_last_busy(&t7xx_dev->pdev->dev);
+	pm_runtime_allow(&t7xx_dev->pdev->dev);
+
+	/* FM350-GL runtime suspend frequently times out on RK3588.
+	 * Keep the device in D0 and rely on system suspend only.
+	 */
+	pm_runtime_forbid(&t7xx_dev->pdev->dev);
+	pm_runtime_put_noidle(&t7xx_dev->pdev->dev);
+	complete_all(&t7xx_dev->init_done);
+}
+
+static int t7xx_pci_pm_reinit(struct t7xx_pci_dev *t7xx_dev)
+{
+	/* The device is kept in FSM re-init flow
+	 * so just roll back PM setting to the init setting.
+	 */
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_INIT);
+
+	/* Reset init_done so that t7xx_pci_pm_prepare() blocks
+	 * subsequent suspend attempts until the modem handshake
+	 * completes again — prevents suspend/resume loops in s2idle.
+	 */
+	reinit_completion(&t7xx_dev->init_done);
+
+	pm_runtime_get_noresume(&t7xx_dev->pdev->dev);
+
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
+	return t7xx_wait_pm_config(t7xx_dev);
+}
+
+void t7xx_pci_pm_exp_detected(struct t7xx_pci_dev *t7xx_dev)
+{
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
+	t7xx_wait_pm_config(t7xx_dev);
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_EXCEPTION);
+}
+
+int t7xx_pci_pm_entity_register(struct t7xx_pci_dev *t7xx_dev, struct md_pm_entity *pm_entity)
+{
+	struct md_pm_entity *entity;
+
+	mutex_lock(&t7xx_dev->md_pm_entity_mtx);
+	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
+		if (entity->id == pm_entity->id) {
+			mutex_unlock(&t7xx_dev->md_pm_entity_mtx);
+			return -EEXIST;
+		}
+	}
+
+	list_add_tail(&pm_entity->entity, &t7xx_dev->md_pm_entities);
+	mutex_unlock(&t7xx_dev->md_pm_entity_mtx);
+	return 0;
+}
+
+int t7xx_pci_pm_entity_unregister(struct t7xx_pci_dev *t7xx_dev, struct md_pm_entity *pm_entity)
+{
+	struct md_pm_entity *entity, *tmp_entity;
+
+	mutex_lock(&t7xx_dev->md_pm_entity_mtx);
+	list_for_each_entry_safe(entity, tmp_entity, &t7xx_dev->md_pm_entities, entity) {
+		if (entity->id == pm_entity->id) {
+			list_del(&pm_entity->entity);
+			mutex_unlock(&t7xx_dev->md_pm_entity_mtx);
+			return 0;
+		}
+	}
+
+	mutex_unlock(&t7xx_dev->md_pm_entity_mtx);
+
+	return -ENXIO;
+}
+
+int t7xx_pci_sleep_disable_complete(struct t7xx_pci_dev *t7xx_dev)
+{
+	struct device *dev = &t7xx_dev->pdev->dev;
+	int ret;
+
+	ret = wait_for_completion_timeout(&t7xx_dev->sleep_lock_acquire,
+					  msecs_to_jiffies(PM_SLEEP_DIS_TIMEOUT_MS));
+	if (!ret)
+		dev_err_ratelimited(dev, "Resource wait complete timed out\n");
+
+	return ret;
+}
+
+/**
+ * t7xx_pci_disable_sleep() - Disable deep sleep capability.
+ * @t7xx_dev: MTK device.
+ *
+ * Lock the deep sleep capability, note that the device can still go into deep sleep
+ * state while device is in D0 state, from the host's point-of-view.
+ *
+ * If device is in deep sleep state, wake up the device and disable deep sleep capability.
+ */
+void t7xx_pci_disable_sleep(struct t7xx_pci_dev *t7xx_dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&t7xx_dev->md_pm_lock, flags);
+	t7xx_dev->sleep_disable_count++;
+	if (atomic_read(&t7xx_dev->md_pm_state) < MTK_PM_RESUMED)
+		goto unlock_and_complete;
+
+	if (t7xx_dev->sleep_disable_count == 1) {
+		u32 status;
+
+		reinit_completion(&t7xx_dev->sleep_lock_acquire);
+		t7xx_dev_set_sleep_capability(t7xx_dev, false);
+
+		status = ioread32(IREG_BASE(t7xx_dev) + T7XX_PCIE_RESOURCE_STATUS);
+		if (status & T7XX_PCIE_RESOURCE_STS_MSK)
+			goto unlock_and_complete;
+
+		t7xx_mhccif_h2d_swint_trigger(t7xx_dev, H2D_CH_DS_LOCK);
+	}
+	spin_unlock_irqrestore(&t7xx_dev->md_pm_lock, flags);
+	return;
+
+unlock_and_complete:
+	spin_unlock_irqrestore(&t7xx_dev->md_pm_lock, flags);
+	complete_all(&t7xx_dev->sleep_lock_acquire);
+}
+
+/**
+ * t7xx_pci_enable_sleep() - Enable deep sleep capability.
+ * @t7xx_dev: MTK device.
+ *
+ * After enabling deep sleep, device can enter into deep sleep state.
+ */
+void t7xx_pci_enable_sleep(struct t7xx_pci_dev *t7xx_dev)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&t7xx_dev->md_pm_lock, flags);
+	t7xx_dev->sleep_disable_count--;
+	if (atomic_read(&t7xx_dev->md_pm_state) < MTK_PM_RESUMED)
+		goto unlock;
+
+	if (t7xx_dev->sleep_disable_count == 0)
+		t7xx_dev_set_sleep_capability(t7xx_dev, true);
+
+unlock:
+	spin_unlock_irqrestore(&t7xx_dev->md_pm_lock, flags);
+}
+
+static int t7xx_send_pm_request(struct t7xx_pci_dev *t7xx_dev, u32 request)
+{
+	unsigned long wait_ret;
+
+	reinit_completion(&t7xx_dev->pm_sr_ack);
+	t7xx_mhccif_h2d_swint_trigger(t7xx_dev, request);
+	wait_ret = wait_for_completion_timeout(&t7xx_dev->pm_sr_ack,
+					       msecs_to_jiffies(PM_ACK_TIMEOUT_MS));
+	if (!wait_ret)
+		return -ETIMEDOUT;
+
+	return 0;
+}
+
+static int __t7xx_pci_pm_suspend(struct pci_dev *pdev)
+{
+	enum t7xx_pm_id entity_id = PM_ENTITY_ID_INVALID;
+	struct t7xx_pci_dev *t7xx_dev;
+	struct md_pm_entity *entity;
+	int ret;
+
+	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* Do not let a deferred PLDR fire while we are trying to suspend.
+	 * cancel_delayed_work_sync waits for an in-flight worker to
+	 * finish.  This is bounded (PLDR + reprobe ≤ T7XX_INIT_TIMEOUT)
+	 * and safe: the worker holds no lock that this callback path
+	 * needs.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT ||
+	    READ_ONCE(t7xx_dev->mode) != T7XX_READY) {
+		dev_warn(&pdev->dev, "[PM] Suspend: modem not ready, skipping PM handshake\n");
+		return 0;
+	}
+
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
+	ret = t7xx_wait_pm_config(t7xx_dev);
+	if (ret) {
+		iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
+		if (pci_channel_offline(pdev)) {
+			dev_err(&pdev->dev, "Device offline, reset to recover\n");
+			t7xx_reset_device(t7xx_dev, PLDR);
+		}
+		return ret;
+	}
+
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_SUSPENDED);
+	t7xx_pcie_mac_clear_int(t7xx_dev, SAP_RGU_INT);
+	t7xx_dev->rgu_pci_irq_en = false;
+
+	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
+		if (!entity->suspend)
+			continue;
+
+		ret = entity->suspend(t7xx_dev, entity->entity_param);
+		if (ret) {
+			entity_id = entity->id;
+			dev_err(&pdev->dev, "[PM] Suspend error: %d, id: %d\n", ret, entity_id);
+			goto abort_suspend;
+		}
+	}
+
+	ret = t7xx_send_pm_request(t7xx_dev, H2D_CH_SUSPEND_REQ);
+	if (ret) {
+		dev_err(&pdev->dev, "[PM] MD suspend error: %d\n", ret);
+		goto abort_suspend;
+	}
+
+	msleep(50);
+
+	t7xx_send_pm_request(t7xx_dev, H2D_CH_SUSPEND_REQ_AP);
+	if (ret)
+		dev_warn(&pdev->dev, "[PM] SAP suspend timeout, continuing anyway\n");
+
+	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
+		if (entity->suspend_late)
+			entity->suspend_late(t7xx_dev, entity->entity_param);
+	}
+
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
+	return 0;
+
+abort_suspend:
+	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
+		if (entity_id == entity->id)
+			break;
+
+		if (entity->resume)
+			entity->resume(t7xx_dev, entity->entity_param);
+	}
+
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_RESUMED);
+	t7xx_pcie_mac_set_int(t7xx_dev, SAP_RGU_INT);
+	/* PCIe link errors may not be flagged as offline immediately.
+	 * Unconditionally reset the device on suspend failure to recover.
+	 */
+	dev_err(&pdev->dev, "Suspend failed, resetting device to recover\n");
+	t7xx_reset_device(t7xx_dev, PLDR);
+	return ret;
+}
+
+static void t7xx_pcie_interrupt_reinit(struct t7xx_pci_dev *t7xx_dev)
+{
+	t7xx_pcie_set_mac_msix_cfg(t7xx_dev, EXT_INT_NUM);
+
+	/* Disable interrupt first and let the IPs enable them */
+	iowrite32(MSIX_MSK_SET_ALL, IREG_BASE(t7xx_dev) + IMASK_HOST_MSIX_CLR_GRP0_0);
+
+	/* Device disables PCIe interrupts during resume and
+	 * following function will re-enable PCIe interrupts.
+	 */
+	t7xx_pcie_mac_interrupts_en(t7xx_dev);
+	t7xx_pcie_mac_set_int(t7xx_dev, MHCCIF_INT);
+}
+
+static int t7xx_pcie_reinit(struct t7xx_pci_dev *t7xx_dev, bool is_d3)
+{
+	int ret;
+
+	ret = pcim_enable_device(t7xx_dev->pdev);
+	if (ret)
+		return ret;
+
+	t7xx_pcie_mac_atr_init(t7xx_dev);
+	t7xx_pcie_interrupt_reinit(t7xx_dev);
+
+	if (is_d3) {
+		t7xx_mhccif_init(t7xx_dev);
+		t7xx_pci_pm_reinit(t7xx_dev);
+	}
+
+	return 0;
+}
+
+static int t7xx_send_fsm_command(struct t7xx_pci_dev *t7xx_dev, u32 event)
+{
+	struct t7xx_fsm_ctl *fsm_ctl = t7xx_dev->md->fsm_ctl;
+	struct device *dev = &t7xx_dev->pdev->dev;
+	int ret = -EINVAL;
+
+	switch (event) {
+	case FSM_CMD_STOP:
+		ret = t7xx_fsm_append_cmd(fsm_ctl, FSM_CMD_STOP, FSM_CMD_FLAG_WAIT_FOR_COMPLETION);
+		break;
+
+	case FSM_CMD_START:
+		t7xx_pcie_mac_clear_int(t7xx_dev, SAP_RGU_INT);
+		t7xx_pcie_mac_clear_int_status(t7xx_dev, SAP_RGU_INT);
+		t7xx_dev->rgu_pci_irq_en = true;
+		t7xx_pcie_mac_set_int(t7xx_dev, SAP_RGU_INT);
+		ret = t7xx_fsm_append_cmd(fsm_ctl, FSM_CMD_START, 0);
+		break;
+
+	default:
+		break;
+	}
+
+	if (ret)
+		dev_err(dev, "Failure handling FSM command %u, %d\n", event, ret);
+
+	return ret;
+}
+
+int t7xx_pci_reprobe_early(struct t7xx_pci_dev *t7xx_dev)
+{
+	enum t7xx_mode mode = READ_ONCE(t7xx_dev->mode);
+	int ret;
+
+	if (mode == T7XX_FASTBOOT_DOWNLOAD)
+		pm_runtime_put_noidle(&t7xx_dev->pdev->dev);
+
+	ret = t7xx_send_fsm_command(t7xx_dev, FSM_CMD_STOP);
+	if (ret)
+		return ret;
+
+	return 0;
+}
+
+int t7xx_pci_reprobe(struct t7xx_pci_dev *t7xx_dev, bool boot)
+{
+	int ret;
+
+	ret = t7xx_pcie_reinit(t7xx_dev, boot);
+	if (ret)
+		return ret;
+
+	t7xx_clear_rgu_irq(t7xx_dev);
+	return t7xx_send_fsm_command(t7xx_dev, FSM_CMD_START);
+}
+
+static int __t7xx_pci_pm_resume(struct pci_dev *pdev, bool state_check)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	struct md_pm_entity *entity;
+	u32 prev_state;
+	int ret = 0;
+
+	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* A new resume callback supersedes any pending deferred PLDR.
+	 * Cancel before re-evaluating state so the worker cannot run
+	 * concurrently with this callback's reprobe.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT) {
+		dev_info(&pdev->dev, "[PM] Resume: skipped, pm_state <= INIT\n");
+		iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
+		return 0;
+	}
+
+	t7xx_pcie_mac_interrupts_en(t7xx_dev);
+	prev_state = ioread32(IREG_BASE(t7xx_dev) + T7XX_PCIE_PM_RESUME_STATE);
+
+	if (state_check) {
+		u32 atr_reg_val = ioread32(IREG_BASE(t7xx_dev) +
+					   ATR_PCIE_WIN0_T0_ATR_PARAM_SRC_ADDR);
+		dev_info(&pdev->dev, "[PM] Resume: prev_state=%u atr=0x%08x pci_state=%d\n",
+			 prev_state, atr_reg_val, pdev->current_state);
+		if (prev_state == PM_RESUME_REG_STATE_L3 ||
+		    prev_state == PM_RESUME_REG_STATE_INIT) {
+			if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+				dev_err(&pdev->dev,
+					"[PM] Resume: modem dead after %u reprobe attempts, giving up\n",
+					MAX_RESUME_REPROBE_ATTEMPTS);
+				complete_all(&t7xx_dev->init_done);
+				return 0;
+			}
+
+			/* PLDR uses ACPI MRST._RST to power-cycle the modem.
+			 * That is the only recovery path when the PCIe link is
+			 * still up (atr != 0x7f) and the modem firmware is
+			 * stuck in INIT — but it leaves the PCIe root complex
+			 * transiently unstable.
+			 *
+			 * Inside a system-sleep transition the kernel moves on
+			 * to the next stage within microseconds of this
+			 * callback returning (e.g. suspend-then-hibernate's
+			 * s2idle-wake runs .resume and then jumps straight into
+			 * hibernate() / sync_filesystems_hibernate()).  Running
+			 * PLDR in that window wedges NVMe I/O on the same root
+			 * complex indefinitely after
+			 * "PM: hibernation: hibernation entry" — observed
+			 * April 16 21:29; machine stayed at full power until
+			 * the battery drained, hard reset required.
+			 *
+			 * Defer PLDR when pm_suspend_target_state is non-zero:
+			 * mark the modem as not-ready (mode → UNKNOWN) so
+			 * __t7xx_pci_pm_suspend / .freeze skips its PM
+			 * handshake and suspend/hibernate can complete
+			 * cleanly with the modem dead-in-memory.  The next
+			 * resume after the full system wake will find
+			 * pm_suspend_target_state == PM_SUSPEND_ON again and
+			 * run PLDR normally.  Don't burn a retry slot here
+			 * since we didn't actually attempt the reset.
+			 */
+			if (atr_reg_val != 0x0000007f &&
+			    pm_suspend_target_state != PM_SUSPEND_ON) {
+				dev_warn(&pdev->dev,
+					 "[PM] Resume: L3/INIT + link up during system sleep (target=%d), deferring PLDR reset\n",
+					 pm_suspend_target_state);
+				t7xx_mode_update(t7xx_dev, T7XX_UNKNOWN);
+				/* Schedule the reset for after PM machinery
+				 * returns to PM_SUSPEND_ON.  The worker
+				 * reschedules itself if the system is still
+				 * sleeping (STH hibernate leg) and bails if a
+				 * normal resume path recovers the modem first.
+				 */
+				schedule_delayed_work(&t7xx_dev->deferred_pldr_work,
+						      msecs_to_jiffies(DEFERRED_PLDR_DELAY_MS));
+				return 0;
+			}
+
+			t7xx_dev->resume_reprobe_count++;
+			dev_info(&pdev->dev,
+				 "[PM] Resume: L3/INIT detected (prev_state=%u), reprobe attempt %u/%u\n",
+				 prev_state, t7xx_dev->resume_reprobe_count,
+				 MAX_RESUME_REPROBE_ATTEMPTS);
+
+			/* If the PCIe link is still up (ATR window reads a
+			 * normal bus value, not the 0x7f "link down" pattern),
+			 * the modem firmware is stuck in INIT but the host
+			 * side is fine. A plain pcie_reinit won't reset the
+			 * firmware — we need a real HW reset via ACPI PLDR
+			 * (MRST._RST), which is the Lenovo-blessed path for
+			 * the FM350-GL. t7xx_reset_device() handles
+			 * save_state / reprobe_early / ACPI reset /
+			 * restore_state / reprobe internally.
+			 */
+			if (atr_reg_val != 0x0000007f) {
+				dev_info(&pdev->dev,
+					 "[PM] Resume: link up, using PLDR hard reset\n");
+				ret = t7xx_reset_device(t7xx_dev, PLDR);
+				if (ret)
+					goto out_reprobe_failed;
+				/* Reset the cap on success: the only failure mode
+				 * we can detect synchronously is the reprobe call
+				 * itself returning non-zero.  A successful submit
+				 * means the FSM is bringing the modem back up
+				 * (async), and the next L3/INIT resume — e.g. the
+				 * very next hibernate restore — must start with a
+				 * fresh budget, otherwise three healthy hibernate
+				 * cycles in a row exhaust the cap and the fourth
+				 * gives up before even trying.  Mirrors the
+				 * zero-on-success convention in the deferred PLDR
+				 * worker (t7xx_deferred_pldr_worker).
+				 */
+				t7xx_dev->resume_reprobe_count = 0;
+				return 0;
+			}
+
+			ret = t7xx_pci_reprobe_early(t7xx_dev);
+			if (ret)
+				return ret;
+
+			ret = t7xx_pci_reprobe(t7xx_dev, true);
+			if (ret)
+				goto out_reprobe_failed;
+			t7xx_dev->resume_reprobe_count = 0;
+			return 0;
+		}
+
+		if (prev_state == PM_RESUME_REG_STATE_EXP ||
+		    prev_state == PM_RESUME_REG_STATE_L2_EXP) {
+			dev_info(&pdev->dev, "[PM] Resume: exception state %u\n", prev_state);
+			if (prev_state == PM_RESUME_REG_STATE_L2_EXP) {
+				ret = t7xx_pcie_reinit(t7xx_dev, false);
+				if (ret)
+					return ret;
+			}
+
+			atomic_set(&t7xx_dev->md_pm_state, MTK_PM_SUSPENDED);
+			t7xx_dev->rgu_pci_irq_en = true;
+			t7xx_pcie_mac_set_int(t7xx_dev, SAP_RGU_INT);
+
+			t7xx_mhccif_mask_clr(t7xx_dev,
+					     D2H_INT_EXCEPTION_INIT |
+					     D2H_INT_EXCEPTION_INIT_DONE |
+					     D2H_INT_EXCEPTION_CLEARQ_DONE |
+					     D2H_INT_EXCEPTION_ALLQ_RESET |
+					     D2H_INT_PORT_ENUM);
+
+			return ret;
+		}
+
+		if (prev_state == PM_RESUME_REG_STATE_L2) {
+			dev_info(&pdev->dev, "[PM] Resume: L2, reinit PCIe\n");
+			ret = t7xx_pcie_reinit(t7xx_dev, false);
+			if (ret)
+				return ret;
+
+		} else if (prev_state != PM_RESUME_REG_STATE_L1) {
+			dev_warn(&pdev->dev,
+				 "[PM] Resume: unknown state %u, stopping FSM\n", prev_state);
+			ret = t7xx_send_fsm_command(t7xx_dev, FSM_CMD_STOP);
+			if (ret)
+				return ret;
+
+			t7xx_clear_rgu_irq(t7xx_dev);
+			atomic_set(&t7xx_dev->md_pm_state, MTK_PM_SUSPENDED);
+			return 0;
+		}
+	}
+
+	dev_info(&pdev->dev, "[PM] Resume: handshake path\n");
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + DISABLE_ASPM_LOWPWR);
+	t7xx_wait_pm_config(t7xx_dev);
+
+	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
+		if (entity->resume_early)
+			entity->resume_early(t7xx_dev, entity->entity_param);
+	}
+
+	ret = t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ);
+	if (ret) {
+		if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+			dev_err(&pdev->dev,
+				"[PM] MD resume failed after %u reprobe attempts, giving up\n",
+				MAX_RESUME_REPROBE_ATTEMPTS);
+			return ret;
+		}
+
+		t7xx_dev->resume_reprobe_count++;
+		dev_warn(&pdev->dev,
+			 "[PM] MD resume failed (%d), reprobe attempt %u/%u\n", ret,
+			 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
+		ret = t7xx_pci_reprobe_early(t7xx_dev);
+		if (ret)
+			return ret;
+
+		ret = t7xx_pci_reprobe(t7xx_dev, true);
+		if (ret)
+			goto out_reprobe_failed;
+		t7xx_dev->resume_reprobe_count = 0;
+		return 0;
+	}
+
+	if (t7xx_send_pm_request(t7xx_dev, H2D_CH_RESUME_REQ_AP))
+		dev_warn(&pdev->dev, "[PM] SAP resume timeout, continuing anyway\n");
+
+	list_for_each_entry(entity, &t7xx_dev->md_pm_entities, entity) {
+		if (entity->resume) {
+			ret = entity->resume(t7xx_dev, entity->entity_param);
+			if (ret)
+				dev_err(&pdev->dev, "[PM] Resume entry ID: %d error: %d\n",
+					entity->id, ret);
+		}
+	}
+
+	t7xx_dev->rgu_pci_irq_en = true;
+	t7xx_pcie_mac_set_int(t7xx_dev, SAP_RGU_INT);
+	iowrite32(T7XX_L1_BIT(0), IREG_BASE(t7xx_dev) + ENABLE_ASPM_LOWPWR);
+	pm_runtime_mark_last_busy(&pdev->dev);
+	atomic_set(&t7xx_dev->md_pm_state, MTK_PM_RESUMED);
+	t7xx_dev->resume_reprobe_count = 0;
+
+	return ret;
+
+out_reprobe_failed:
+	/* t7xx_pci_pm_reinit() ran as part of the failed reprobe path and
+	 * reset init_done via reinit_completion().  If we leave it reset,
+	 * every subsequent t7xx_pci_pm_prepare() blocks for 20 s and
+	 * returns -EBUSY, triggering a systemd suspend-retry loop that
+	 * eventually freezes the machine (observed April 9, boot -10;
+	 * required hard reset).  Unblock pm_prepare so the system can
+	 * still sleep even when the modem is dead until reboot — same
+	 * policy as the count >= MAX branch and EXCEPTION_HS_TIMEOUT.
+	 */
+	dev_err(&pdev->dev,
+		"[PM] Reprobe failed (%d), unblocking suspend path\n", ret);
+	complete_all(&t7xx_dev->init_done);
+	return ret;
+}
+
+static int t7xx_pci_pm_suspend_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+
+	/* Save PCI state now so the PCI core sees state_saved == true
+	 * and skips pci_prepare_to_sleep(), keeping the device in D0.
+	 * The modem firmware cannot survive D3hot or D3cold.
+	 */
+	pci_save_state(pdev);
+	return 0;
+}
+
+static int t7xx_pci_pm_resume_noirq(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev;
+
+	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* Symmetric with the keepalive .suspend skip: if we never tore down
+	 * the firmware-side PM state, do not touch MSI-X here either. The
+	 * matching unmask lives in __t7xx_pci_pm_resume which we will also
+	 * skip — leaving interrupts in their pre-suspend state preserves the
+	 * "modem was running the entire time" invariant.
+	 */
+	if (t7xx_dev->suspend_skipped)
+		return 0;
+
+	t7xx_pcie_mac_interrupts_dis(t7xx_dev);
+
+	return 0;
+}
+
+static void t7xx_pci_shutdown(struct pci_dev *pdev)
+{
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	/* At real system poweroff/reboot the modem loses power shortly and
+	 * a clean SAP handshake has no consumer.  If the modem's SAP side
+	 * is desynchronised ("[PM] SAP suspend timeout" / "[PM] SAP resume
+	 * timeout, continuing anyway"), __t7xx_pci_pm_suspend would still
+	 * run the full handshake on a half-dead modem and can wedge the
+	 * kernel in device_shutdown() — observed 2026-04-18 00:28, silent
+	 * wait (empty pstore), hard reset required.  c52a9aa added
+	 * t7xx_md_exit() to catch a different shutdown hang (TX thread
+	 * loop) but left __t7xx_pci_pm_suspend unconditional.
+	 *
+	 * Force mode to T7XX_UNKNOWN so __t7xx_pci_pm_suspend takes its
+	 * "modem not ready, skipping PM handshake" early-return and
+	 * t7xx_md_exit skips FSM_CMD_PRE_STOP.  Only local cleanup
+	 * (CLDMA stop with 1 s poll, port-proxy uninit, workqueue
+	 * destroy, TX-thread kthread_stop) runs — no modem-side I/O.
+	 * Mirrors the approach of 5305cb5 (hibernate PLDR defer).
+	 *
+	 * Only apply inside the real poweroff/reboot/halt window — PCI
+	 * .shutdown is currently only invoked from kernel_power_off() /
+	 * kernel_restart() / kernel_halt(), but guard defensively against
+	 * future kernel changes that might route other contexts here.
+	 */
+	if (system_state == SYSTEM_POWER_OFF ||
+	    system_state == SYSTEM_RESTART ||
+	    system_state == SYSTEM_HALT)
+		t7xx_mode_update(t7xx_dev, T7XX_UNKNOWN);
+
+	__t7xx_pci_pm_suspend(pdev);
+	t7xx_md_exit(t7xx_dev);
+}
+
+static int t7xx_pci_pm_prepare(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev;
+
+	t7xx_dev = pci_get_drvdata(pdev);
+
+	/* .prepare is the earliest PM callback — cancel any pending
+	 * deferred PLDR before waiting on init_done.  Otherwise a worker
+	 * scheduled in a previous resume might fire between our .prepare
+	 * and .suspend, racing the suspend freezer.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	if (!wait_for_completion_timeout(&t7xx_dev->init_done, T7XX_INIT_TIMEOUT * HZ)) {
+		dev_warn(dev, "Not ready for system sleep, blocking suspend.\n");
+		return -EBUSY;
+	}
+
+	return 0;
+}
+
+static int t7xx_pci_pm_suspend(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	/* Keepalive: only meaningful for suspend-to-idle. Hibernate (.freeze)
+	 * uses the same wrapper but pm_suspend_target_state is PM_SUSPEND_ON
+	 * during the hibernate freeze callback path, so the check naturally
+	 * gates this to s2idle (and S3, which behaves the same way wrt the
+	 * modem firmware — but Lenovo platforms ship s2idle only).
+	 */
+	if (keepalive_s2idle && pm_suspend_target_state == PM_SUSPEND_TO_IDLE) {
+		dev_info(dev, "[PM] keepalive_s2idle: skipping firmware suspend handshake\n");
+		t7xx_dev->suspend_skipped = true;
+		return 0;
+	}
+	t7xx_dev->suspend_skipped = false;
+	return __t7xx_pci_pm_suspend(pdev);
+}
+
+static int t7xx_pci_pm_resume(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+
+	if (t7xx_dev->suspend_skipped) {
+		t7xx_dev->suspend_skipped = false;
+		dev_info(dev, "[PM] keepalive_s2idle: skipping resume (modem stayed online)\n");
+		return 0;
+	}
+	return __t7xx_pci_pm_resume(pdev, true);
+}
+
+static int t7xx_pci_pm_thaw(struct device *dev)
+{
+	return __t7xx_pci_pm_resume(to_pci_dev(dev), false);
+}
+
+static int t7xx_pci_pm_restore(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct t7xx_pci_dev *t7xx_dev = pci_get_drvdata(pdev);
+	int ret;
+
+	/* Across S4 the modem firmware is power-cycled but the driver's
+	 * in-memory CLDMA ring state (tx_next / tr_done / pending GPDs)
+	 * is restored from the hibernation image.  The HS1/HS2 handshake
+	 * runs over MHCCIF and completes cleanly even when those ring
+	 * pointers no longer match the hardware queue pointers, so the
+	 * plain reprobe path can leave the modem looking healthy
+	 * (md_pm_state=RESUMED, mode=READY) while every MBIM transaction
+	 * times out.  Force a chip-level PLDR on .restore so the firmware
+	 * boots fresh AND the subsequent reprobe rebuilds CLDMA state from
+	 * scratch.  Safe here because .restore runs after hibernation_exit
+	 * (pm_suspend_target_state == PM_SUSPEND_ON), so the April-16
+	 * NVMe-wedge scenario that motivated commit 5305cb5 does not apply.
+	 */
+
+	/* Match every other PM entry point (see lines 552, 718, 986, 1031): a
+	 * deferred PLDR worker scheduled before .freeze must not race the
+	 * synchronous PLDR we are about to run.
+	 */
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	if (atomic_read(&t7xx_dev->md_pm_state) <= MTK_PM_INIT)
+		atomic_set(&t7xx_dev->md_pm_state, MTK_PM_SUSPENDED);
+
+	if (t7xx_dev->resume_reprobe_count >= MAX_RESUME_REPROBE_ATTEMPTS) {
+		dev_err(&pdev->dev,
+			"[PM] Restore: modem dead after %u attempts, giving up\n",
+			MAX_RESUME_REPROBE_ATTEMPTS);
+		/* Unblock .prepare so the next suspend cycle isn't held up
+		 * 20 s by wait_for_completion_timeout(&init_done) — that was
+		 * the e22d499 / April-9 systemd suspend-retry regression.
+		 */
+		complete_all(&t7xx_dev->init_done);
+		return 0;
+	}
+	t7xx_dev->resume_reprobe_count++;
+
+	dev_info(&pdev->dev, "[PM] Restore: forcing PLDR (attempt %u/%u)\n",
+		 t7xx_dev->resume_reprobe_count, MAX_RESUME_REPROBE_ATTEMPTS);
+
+	ret = t7xx_reset_device(t7xx_dev, PLDR);
+	if (ret) {
+		dev_err(&pdev->dev,
+			"[PM] Restore: PLDR failed (%d), unblocking suspend path\n",
+			ret);
+		complete_all(&t7xx_dev->init_done);
+		return ret;
+	}
+
+	t7xx_dev->resume_reprobe_count = 0;
+	return 0;
+}
+
+static int t7xx_pci_pm_runtime_suspend(struct device *dev)
+{
+	return __t7xx_pci_pm_suspend(to_pci_dev(dev));
+}
+
+static int t7xx_pci_pm_runtime_resume(struct device *dev)
+{
+	return __t7xx_pci_pm_resume(to_pci_dev(dev), true);
+}
+
+static const struct dev_pm_ops t7xx_pci_pm_ops = {
+	.prepare = t7xx_pci_pm_prepare,
+	.suspend = t7xx_pci_pm_suspend,
+	.suspend_noirq = t7xx_pci_pm_suspend_noirq,
+	.resume = t7xx_pci_pm_resume,
+	.resume_noirq = t7xx_pci_pm_resume_noirq,
+	.freeze = t7xx_pci_pm_suspend,
+	.freeze_noirq = t7xx_pci_pm_suspend_noirq,
+	.thaw = t7xx_pci_pm_thaw,
+	.poweroff = t7xx_pci_pm_suspend,
+	.poweroff_noirq = t7xx_pci_pm_suspend_noirq,
+	.restore = t7xx_pci_pm_restore,
+	.restore_noirq = t7xx_pci_pm_resume_noirq,
+	.runtime_suspend = t7xx_pci_pm_runtime_suspend,
+	.runtime_resume = t7xx_pci_pm_runtime_resume
+};
+
+static int t7xx_request_irq(struct pci_dev *pdev)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	int ret = 0, i;
+
+	t7xx_dev = pci_get_drvdata(pdev);
+
+	for (i = 0; i < EXT_INT_NUM; i++) {
+		const char *irq_descr;
+		int irq_vec;
+
+		if (!t7xx_dev->intr_handler[i])
+			continue;
+
+		irq_descr = devm_kasprintf(&pdev->dev, GFP_KERNEL, "%s_%d",
+					   dev_driver_string(&pdev->dev), i);
+		if (!irq_descr) {
+			ret = -ENOMEM;
+			break;
+		}
+
+		irq_vec = pci_irq_vector(pdev, i);
+		ret = request_threaded_irq(irq_vec, t7xx_dev->intr_handler[i],
+					   t7xx_dev->intr_thread[i], 0, irq_descr,
+					   t7xx_dev->callback_param[i]);
+		if (ret) {
+			dev_err(&pdev->dev, "Failed to request IRQ: %d\n", ret);
+			break;
+		}
+	}
+
+	if (ret) {
+		while (i--) {
+			if (!t7xx_dev->intr_handler[i])
+				continue;
+
+			free_irq(pci_irq_vector(pdev, i), t7xx_dev->callback_param[i]);
+		}
+	}
+
+	return ret;
+}
+
+static int t7xx_setup_msix(struct t7xx_pci_dev *t7xx_dev)
+{
+	struct pci_dev *pdev = t7xx_dev->pdev;
+	int ret;
+
+	/* Only using 6 interrupts, but HW-design requires power-of-2 IRQs allocation */
+	ret = pci_alloc_irq_vectors(pdev, EXT_INT_NUM, EXT_INT_NUM, PCI_IRQ_MSIX);
+	if (ret < 0) {
+		dev_err(&pdev->dev, "Failed to allocate MSI-X entry: %d\n", ret);
+		return ret;
+	}
+
+	ret = t7xx_request_irq(pdev);
+	if (ret) {
+		pci_free_irq_vectors(pdev);
+		return ret;
+	}
+
+	t7xx_pcie_set_mac_msix_cfg(t7xx_dev, EXT_INT_NUM);
+	return 0;
+}
+
+static int t7xx_interrupt_init(struct t7xx_pci_dev *t7xx_dev)
+{
+	int ret, i;
+
+	if (!t7xx_dev->pdev->msix_cap)
+		return -EINVAL;
+
+	ret = t7xx_setup_msix(t7xx_dev);
+	if (ret)
+		return ret;
+
+	/* IPs enable interrupts when ready */
+	for (i = 0; i < EXT_INT_NUM; i++)
+		t7xx_pcie_mac_set_int(t7xx_dev, i);
+
+	return 0;
+}
+
+static void t7xx_pci_infracfg_ao_calc(struct t7xx_pci_dev *t7xx_dev)
+{
+	t7xx_dev->base_addr.infracfg_ao_base = t7xx_dev->base_addr.pcie_ext_reg_base +
+					      INFRACFG_AO_DEV_CHIP -
+					      t7xx_dev->base_addr.pcie_dev_reg_trsl_addr;
+}
+
+static int t7xx_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	void __iomem *iomem;
+	int ret;
+
+	t7xx_dev = devm_kzalloc(&pdev->dev, sizeof(*t7xx_dev), GFP_KERNEL);
+	if (!t7xx_dev)
+		return -ENOMEM;
+
+	pci_set_drvdata(pdev, t7xx_dev);
+	t7xx_dev->pdev = pdev;
+
+	ret = pcim_enable_device(pdev);
+	if (ret)
+		return ret;
+
+	pci_set_master(pdev);
+
+	iomem = pcim_iomap_region(pdev, T7XX_PCI_IREG_BASE, DRIVER_NAME);
+	ret = PTR_ERR_OR_ZERO(iomem);
+	if (ret) {
+		dev_err(&pdev->dev, "Could not request IREG BAR: %d\n", ret);
+		return -ENOMEM;
+	}
+	IREG_BASE(t7xx_dev) = iomem;
+
+	iomem = pcim_iomap_region(pdev, T7XX_PCI_EREG_BASE, DRIVER_NAME);
+	ret = PTR_ERR_OR_ZERO(iomem);
+	if (ret) {
+		dev_err(&pdev->dev, "Could not request EREG BAR: %d\n", ret);
+		return -ENOMEM;
+	}
+	t7xx_dev->base_addr.pcie_ext_reg_base = iomem;
+
+	ret = dma_set_mask(&pdev->dev, DMA_BIT_MASK(64));
+	if (ret) {
+		dev_err(&pdev->dev, "Could not set PCI DMA mask: %d\n", ret);
+		return ret;
+	}
+
+	ret = dma_set_coherent_mask(&pdev->dev, DMA_BIT_MASK(64));
+	if (ret) {
+		dev_err(&pdev->dev, "Could not set consistent PCI DMA mask: %d\n", ret);
+		return ret;
+	}
+
+	ret = t7xx_pci_pm_init(t7xx_dev);
+	if (ret)
+		return ret;
+
+	t7xx_pcie_mac_atr_init(t7xx_dev);
+	t7xx_pci_infracfg_ao_calc(t7xx_dev);
+	t7xx_mhccif_init(t7xx_dev);
+
+	ret = t7xx_md_init(t7xx_dev);
+	if (ret)
+		return ret;
+
+	t7xx_pcie_mac_interrupts_dis(t7xx_dev);
+
+	ret = sysfs_create_group(&t7xx_dev->pdev->dev.kobj,
+				 &t7xx_attribute_group);
+	if (ret)
+		goto err_md_exit;
+
+	ret = t7xx_interrupt_init(t7xx_dev);
+	if (ret)
+		goto err_remove_group;
+
+
+	t7xx_pcie_mac_set_int(t7xx_dev, MHCCIF_INT);
+	t7xx_pcie_mac_interrupts_en(t7xx_dev);
+
+	return 0;
+
+err_remove_group:
+	sysfs_remove_group(&t7xx_dev->pdev->dev.kobj,
+			   &t7xx_attribute_group);
+
+err_md_exit:
+	t7xx_md_exit(t7xx_dev);
+	return ret;
+}
+
+static void t7xx_pci_remove(struct pci_dev *pdev)
+{
+	struct t7xx_pci_dev *t7xx_dev;
+	int i;
+
+	t7xx_dev = pci_get_drvdata(pdev);
+
+	cancel_delayed_work_sync(&t7xx_dev->deferred_pldr_work);
+
+	sysfs_remove_group(&t7xx_dev->pdev->dev.kobj,
+			   &t7xx_attribute_group);
+	t7xx_md_exit(t7xx_dev);
+
+	for (i = 0; i < EXT_INT_NUM; i++) {
+		if (!t7xx_dev->intr_handler[i])
+			continue;
+
+		free_irq(pci_irq_vector(pdev, i), t7xx_dev->callback_param[i]);
+	}
+
+	pci_free_irq_vectors(t7xx_dev->pdev);
+}
+
+static const struct pci_device_id t7xx_pci_table[] = {
+	{ PCI_DEVICE(PCI_VENDOR_ID_MEDIATEK, 0x4d75) },
+	{ PCI_DEVICE(0x14c0, 0x4d75) }, // Dell DW5933e
+	{ }
+};
+MODULE_DEVICE_TABLE(pci, t7xx_pci_table);
+
+static struct pci_driver t7xx_pci_driver = {
+	.name = DRIVER_NAME,
+	.id_table = t7xx_pci_table,
+	.probe = t7xx_pci_probe,
+	.remove = t7xx_pci_remove,
+	.driver.pm = &t7xx_pci_pm_ops,
+	.shutdown = t7xx_pci_shutdown,
+};
+
+module_pci_driver(t7xx_pci_driver);
+
+MODULE_AUTHOR("MediaTek Inc");
+MODULE_DESCRIPTION("MediaTek PCIe 5G WWAN modem T7xx driver");
+MODULE_LICENSE("GPL");

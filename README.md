@@ -1,0 +1,257 @@
+# Fix Fibocom FM350 (mtk_t7xx) on Fedora
+
+Patches the `mtk_t7xx` kernel driver so the Fibocom FM350-GL (MediaTek T700, PCI ID `14c3:4d75`) WWAN modem actually works on Fedora (kernels 6.17+).
+
+Tested on Lenovo ThinkPad X1 Carbon Gen 11, Fedora 43, kernel 6.18.x – 6.19.x. Current stable release: **v1.2.0** (extensive S4 / suspend-then-hibernate testing).
+
+Related Fedora discussion: [Issue activating mobile internet modem on a Lenovo ThinkPad X1 Yoga Gen 8](https://discussion.fedoraproject.org/t/issue-activating-mobile-internet-modem-on-a-lenovo-thinkpad-x1-yoga-gen-8/170623)
+
+## The problem
+
+On Fedora 43 the in-tree `mtk_t7xx` driver fails to initialize the modem. Multiple issues stack up:
+
+1. **PM timeout treated as fatal** -- the modem's PCIe power-management status register never becomes ready. The driver aborts instead of continuing without PM.
+2. **NULL pointer crash (double-uninit)** -- the error-recovery path calls `kthread_stop()` twice on the same thread without NULLing the pointer.
+3. **NULL pointer crash (kthread_run failure)** -- if `kthread_run()` fails, the thread pointer is left as `ERR_PTR`, so `kthread_stop()` dereferences garbage.
+4. **FCC unlock broken** -- Lenovo's unlock binary segfaults, and ModemManager's built-in unlock script silently fails because `xxd` isn't installed.
+5. **Lenovo services hijack the modem** -- `fibo_helper` / `fibo_flash` / `fwswitch` / `lenovo-cfgservice` force the modem into fastboot mode ~15 s after it connects.
+6. **Shutdown hangs for hours** -- `t7xx_pci_shutdown()` only runs the suspend path, which leaves the TX thread alive. When the modem is unresponsive, the thread polls forever and blocks poweroff.
+7. **s2idle sleep kills the connection** -- after resume the modem's MBIM session is stale but ModemManager doesn't know, so it loops "Operation aborted" forever.
+8. **Dead modem after sleep** -- the modem firmware sometimes reboots during s2idle. The ATR register retains a stale valid value, so the driver skips reprobing and attempts a normal handshake resume. The SAP channel times out but the driver continues anyway, leaving the modem in a zombie state where all communication fails.
+9. **Infinite reprobe loop freezes system** -- the fix for issue 8 unconditionally reprobed on SAP resume timeout, but this also triggers during normal L1 runtime PM resumes (e.g. when the modem is rfkill-blocked). The reprobe restarts the modem, runtime PM re-enables, the same timeout recurs, creating an infinite loop. After ~10 minutes of repeated reprobes, kernel memory is corrupted, causing a General Protection Fault, RCU stall, and total system freeze requiring a hard reboot.
+10. **Dead modem after s2idle wake (v1.1.3)** -- the hibernate-hang fix introduced in v1.1.2 deferred a PLDR reset to avoid wedging NVMe during hibernate entry, assuming a later resume callback would run it. That assumption only held when STH continued into hibernate. If the user woke from s2idle before the hibernate delay, no later callback ran and the modem stayed in L3/INIT with every port write returning EIO — only a cold reboot recovered.
+11. **CLDMA ring desync after S4 resume (v1.2.0)** -- after suspend-then-hibernate cycles that actually reached S4, the post-resume plain reprobe path sometimes left the driver's in-memory CLDMA ring SW state stale relative to the firmware's fresh hardware queue pointers. The MD handshake (via MHCCIF, not CLDMA) reported success, but every MBIM transaction timed out. Smoking gun: `CLDMA1 queue 0 is not empty` in dmesg, followed by ModemManager SIGABRTing every ~36 s. Required reboot to recover.
+
+The same hardware works fine on Ubuntu (kernel 6.14) because it uses IOMMU passthrough and doesn't ship the Lenovo services.
+
+All issues are fixed by this project -- driver patches (across three source files), plus system-level fixes handled by the install script.
+
+For the full history of what was tried, what regressed, and why each fix
+exists, see [`docs/journal.md`](docs/journal.md).
+
+## Disclaimer
+
+This project patches an in-tree kernel driver and modifies system-level
+services (ModemManager, systemd sleep hooks, Lenovo Fibocom services).
+It has been stable on the hardware and kernel listed above, but
+kernel-mode bugs can always crash the system or, in rare cases, lead to
+data loss.
+
+**Use at your own risk.** I accept no liability for any damage, data
+loss, hardware issues, or other consequences arising from installing or
+running any part of this project. By running the scripts or loading the
+patched module you agree that you do so on your own responsibility.
+
+If anything here is unclear, read the scripts and patches before
+running them — everything is plain shell and a few hundred lines of C.
+
+## Quick start
+
+```bash
+# 1. Install build dependencies
+sudo dnf install kernel-devel-$(uname -r) kernel-headers gcc make dkms vim-common
+
+# 2. Add IOMMU passthrough (required for the modem's DMA)
+sudo grubby --update-kernel=ALL --args="iommu=pt"
+
+# 3. Clone this repo
+git clone https://github.com/someoneelse131/mtk-t7xx-fix.git
+cd mtk-t7xx-fix
+
+# 4. Build, install, and reboot (one command does everything)
+bash reinstall.sh
+```
+
+The script will build the module as your user, then `sudo` for the install step. After install it prompts for confirmation before rebooting.
+
+**Non-interactive mode.** Pass `-y` / `--yes` to skip prompts
+(the `iommu=pt` warning, the suspend-strategy choice, and the reboot
+confirmation). Useful for scripting:
+
+```bash
+bash reinstall.sh -y                     # default = full suspend
+bash reinstall.sh -y --keepalive         # opt into keepalive_s2idle
+bash reinstall.sh -y --no-keepalive      # explicit full suspend
+```
+
+## Suspend strategy: full suspend vs `keepalive_s2idle`
+
+On suspend-to-idle (lid close, before any hibernate transition) the
+driver can either tell the modem firmware to suspend or leave it
+running. The installer prompts for this; you can re-run `reinstall.sh`
+any time to change.
+
+| | Full suspend (default) | `keepalive_s2idle` |
+|---|---|---|
+| **Resume latency** | 30–45 s before mobile data is back (PLDR + port reprobe) | < 5 s (modem was never offline) |
+| **s2idle idle cost** | ~0 mW from the modem | ~100 mW (≈0.03 % battery per 10 min) |
+| **Hibernate (S4)** | full firmware power-down (always) | full firmware power-down (always) |
+| **Risk** | tested, stable | newer; modem firmware idles unattended for up to 10 min |
+
+The keepalive path skips the `H2D_CH_SUSPEND_REQ` handshake during
+s2idle and lets the modem keep its MBIM session, network registration,
+and PDP context. Hibernate behaviour is identical either way — the
+firmware loses power across S4 regardless of this setting.
+
+Toggle at runtime (until next reboot):
+
+```bash
+echo Y | sudo tee /sys/module/mtk_t7xx/parameters/keepalive_s2idle
+echo N | sudo tee /sys/module/mtk_t7xx/parameters/keepalive_s2idle
+```
+
+Persistent setting lives at `/etc/modprobe.d/mtk-t7xx-keepalive.conf`
+(only present when keepalive is enabled).
+
+## After reboot
+
+```bash
+# Check everything is working
+bash verify.sh
+
+# Modem state should be "registered" with power "on"
+mmcli -m 0
+
+# WWAN interface should be listed
+nmcli device status
+```
+
+## Connect mobile data
+
+```bash
+# Create a connection (replace APN with your carrier's)
+nmcli connection add type gsm ifname wwan0mbim0 con-name "Mobile" apn internet
+
+# Connect
+nmcli connection up "Mobile"
+```
+
+Replace `internet` with your carrier's APN.
+
+## After a kernel update
+
+DKMS rebuilds the module automatically for new kernels. If the modem stops working after an update:
+
+```bash
+cd mtk-t7xx-fix
+bash reinstall.sh
+```
+
+## What `reinstall.sh` does
+
+All of this is idempotent -- safe to run repeatedly.
+
+1. Checks for `kernel-devel` headers and warns if `iommu=pt` is missing
+2. Builds the patched module from source
+3. Installs via DKMS (survives kernel updates)
+4. Installs ModemManager's AT-based FCC unlock script (replaces the crashing Lenovo binary)
+5. Installs `xxd` if missing (needed by the FCC unlock script)
+6. Disables Lenovo Fibocom services that force the modem into fastboot
+7. Adds a systemd drop-in to cap ModemManager's stop timeout at 10 s (it hangs for 45 s otherwise)
+8. Installs a systemd sleep hook to restart ModemManager after resume (fixes stale MBIM session)
+9. Prompts whether to enable `keepalive_s2idle` (modem stays online during s2idle for fast resume; see below)
+10. Rebuilds initramfs and reboots
+
+## Other scripts
+
+| Script | Purpose |
+|---|---|
+| `verify.sh` | Check module, dmesg, devices, ModemManager status |
+| `uninstall.sh` | Remove patched module and restore the in-tree version |
+
+## Uninstall
+
+```bash
+sudo bash uninstall.sh        # interactive
+sudo bash uninstall.sh -y     # non-interactive, auto-reboot
+```
+
+Removes every installed DKMS version, the sleep hooks, the FCC
+unlock script, and the ModemManager drop-in. Leaves Fibocom services
+disabled for safety. Prompts before removing `iommu=pt`.
+
+For the full inventory of what was installed, the warnings about
+downgrading to the in-tree driver, a manual fallback if the script
+fails, and troubleshooting: see [`docs/uninstall.md`](docs/uninstall.md).
+
+## Troubleshooting
+
+**Modem not detected after reboot:**
+```bash
+dkms status                 # patched module installed?
+lsmod | grep t7xx           # module loaded?
+sudo dmesg | grep -i t7xx   # driver errors?
+```
+
+**Modem shows `disabled` / `power state: low`:**
+
+FCC unlock didn't run. Check:
+```bash
+ls -la /usr/lib64/ModemManager/fcc-unlock.d/14c3:4d75   # script installed?
+which xxd                                                 # xxd available?
+```
+If either is missing, re-run `bash reinstall.sh`.
+
+**`mmcli -m 0 --enable` gives "Invalid transition":**
+```bash
+sudo systemctl restart ModemManager
+sleep 15
+mmcli -m 0
+```
+
+**Modem connects then drops after ~15 seconds:**
+
+Lenovo services are forcing the modem into fastboot:
+```bash
+journalctl -b | grep fastboot_switching
+# If you see "t7xx_mode, command: fastboot_switching":
+sudo systemctl disable --now fibo_helper.service fibo_flash.service fwswitch.service lenovo-cfgservice.service
+sudo reboot
+```
+
+**Modem not working after sleep/resume:**
+
+ModemManager should restart automatically after resume. If it doesn't:
+```bash
+sudo systemctl restart ModemManager
+sleep 15
+mmcli -m 0
+```
+If the modem is gone from PCI entirely, a full reboot is needed.
+
+**Connection fails with "service option not subscribed":**
+
+Wrong APN. Check your carrier and update:
+```bash
+nmcli connection modify "Mobile" gsm.apn "your.carrier.apn"
+nmcli connection up "Mobile"
+```
+
+## Applies to
+
+Tested on a ThinkPad X1 Carbon Gen 11 with Fibocom FM350-GL, Fedora 43, kernel 6.18. Should also work on:
+
+- Other Lenovo laptops with the Fibocom FM350-GL (PCI `14c3:4d75`) -- T14s Gen 4, etc.
+- Dell DW5933e (PCI `14c0:4d75`) -- same MediaTek T700 chip, already in the driver's PCI ID table
+- Fedora 42 with kernel 6.17+ (untested)
+- Likely any distro that uses strict IOMMU by default
+
+## Technical details
+
+The patched driver source lives in `src/`. Key changes:
+
+| File | Fix |
+|---|---|
+| `t7xx_pci.c` | PM timeout made non-fatal (warn + continue), poll timeout increased to 500 ms, D3cold disabled, suspend_noirq/resume_noirq keep the device in D0 with a reprobe fallback on handshake failure |
+| `t7xx_pci.c` | SAP resume timeout triggers reprobe only when modem rebooted (`prev_state=INIT`), non-fatal for normal L1/L2 resumes |
+| `t7xx_pci.c` | Resume reprobe attempts capped at 3 to prevent infinite loop, counter resets on successful resume |
+| `t7xx_pci.c` | Shutdown calls `t7xx_md_exit()` after suspend to stop the TX thread and prevent the poweroff hang |
+| `t7xx_pci.c` | Shutdown forces `mode=UNKNOWN` on poweroff/reboot so the PM handshake is skipped against a desynchronised SAP |
+| `t7xx_pci.c` | Hibernate entry defers PLDR when PCIe link is still up (avoids NVMe wedge), with a `delayed_work` follow-up that actually runs the deferred reset after resume completes (covers the s2idle-wake-only path) |
+| `t7xx_pci.c` | `.restore` (post-S4 resume) always forces a chip-level PLDR + full reprobe instead of the plain handshake-only path. Catches CLDMA ring desync after firmware power-cycle. Scoped to `.restore` only — `.resume` / `.thaw` / `.runtime_resume` keep their fast plain-reprobe behaviour |
+| `t7xx_pci.c` | Optional `keepalive_s2idle` module param: when set, `.suspend` is a no-op for `PM_SUSPEND_TO_IDLE` and `.resume` / `.resume_noirq` mirror the skip via a `suspend_skipped` flag — modem firmware stays online across s2idle, ~40 s faster wake; hibernate paths are unaffected |
+| `t7xx_port_ctrl_msg.c` | NULL `port->thread` after `kthread_stop()` (prevents double-uninit crash) |
+| `t7xx_port_ctrl_msg.c` | NULL `port->thread` on `kthread_run()` failure (prevents ERR_PTR dereference) |
+| `t7xx_state_monitor.c` | Device-stage timeout increased to 60 s |
+
+Full per-commit reasoning and timeline in [`docs/journal.md`](docs/journal.md).

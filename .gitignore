@@ -1,0 +1,23 @@
+# kbuild 产物
+src/*.o
+src/*.ko
+src/*.mod
+src/*.mod.c
+src/*.mod.o
+src/modules.order
+src/Module.symvers
+src/.*.cmd
+src/.*.o.cmd
+src/.*.ko.cmd
+src/.*.mod.cmd
+src/.*.mod.o.cmd
+src/.modules.order.cmd
+src/.Module.symvers.cmd
+
+# 编辑器/系统杂项
+*.swp
+*~
+.DS_Store
+
+# 临时下载的补丁（视情况保留）
+# 0003-wwan-core-slicing-headroom.patch
