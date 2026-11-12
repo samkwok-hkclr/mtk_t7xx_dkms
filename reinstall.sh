@@ -164,6 +164,7 @@ EOF
 systemctl daemon-reload
 
 # --- Systemd sleep hook for ModemManager ---
+mkdir -p /usr/lib/systemd/system-sleep
 SLEEP_HOOK="/usr/lib/systemd/system-sleep/99-modem-fix.sh"
 cat > "$SLEEP_HOOK" <<'HOOKEOF'
 #!/bin/bash
