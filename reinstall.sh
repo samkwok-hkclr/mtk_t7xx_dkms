@@ -56,22 +56,6 @@ if ! grep -q 'iommu=pt' /proc/cmdline; then
     fi
 fi
 
-# --- DTB sanity check (RK3588 alignment fix) ---
-DTB=""
-for cand in "/boot/dtb-$KVER/rockchip/rk3588-orangepi-5-max.dtb" \
-            "/boot/dtb/rockchip/rk3588-orangepi-5-max.dtb"; do
-    [ -f "$cand" ] && { DTB="$cand"; break; }
-done
-if [ -n "$DTB" ] && command -v dtc >/dev/null 2>&1; then
-    if dtc -I dtb -O dts "$DTB" 2>/dev/null | grep -q '0x3fff0000'; then
-        echo "OK: DTB pcie@fe150000 ranges already patched (0x3fff0000)."
-    else
-        echo "WARNING: DTB pcie@fe150000 ranges still 0x40000000."
-        echo "  RK3588 alignment fault will recur. See docs/ or earlier"
-        echo "  instructions to change 0x40000000 -> 0x3fff0000 in the DTS."
-    fi
-fi
-
 # --- Modem suspend strategy prompt ---
 if [ -z "$KEEPALIVE_S2IDLE" ]; then
     if [ -f "$KEEPALIVE_CONF" ] && grep -q '^[[:space:]]*options.*keepalive_s2idle=1' "$KEEPALIVE_CONF"; then
@@ -105,7 +89,7 @@ fi
 # --- Build (no root needed) ---
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "=== Building patched mtk_t7xx module ==="
-    cd "$SCRIPT_DIR/src"
+    cd "$SCRIPT_DIR/mtk_t7xx"
     make -C "/lib/modules/$KVER/build" M="$PWD" clean 2>/dev/null || true
     rm -f .*.cmd modules.order Module.symvers 2>/dev/null || true
     make -C "/lib/modules/$KVER/build" M="$PWD" modules
